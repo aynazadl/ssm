@@ -818,7 +818,243 @@ class InputDrivenObservations(Observations):
         of latent discrete states.
         """
         raise NotImplementedError
+    
+class IndepInputDrivenObservations(Observations):
+    def __init__(self, K, D, M=0, C=2, prior_means=None, prior_sigmas=None):
+        """
+        Initialize independent input-output observations with constraints.
+        @param K: number of states
+        @param D: dimensionality of output
+        @param C: number of distinct classes for each dimension of output
+        @param prior_means: List of tuples for (mean_kernel, mean_prev_resp) for each state
+        @param prior_sigmas: List of tuples for (sigma_kernel, sigma_prev_resp) for each state
+        """
+        super(IndepInputDrivenObservations, self).__init__(K, D, M, C)
+        self.C = C
+        self.M = M
+        self.D = D
+        self.K = K
+        self.prior_means = prior_means
+        self.prior_sigmas = prior_sigmas
+        # Parameters linking input to distribution over output classes
+        self.Wk = npr.randn(K, C - 1, M)
 
+    @property
+    def params(self):
+        return self.Wk
+
+    @params.setter
+    def params(self, value):
+        self.Wk = value
+
+    def permute(self, perm):
+        self.Wk = self.Wk[perm]
+
+    def log_prior(self):
+        """
+        Override the log prior to enforce constraints based on state-specific priors:
+        - State 1 (perseverative): kernel has zero weights, prev_resp has non-zero weights.
+        - State 2 (engaged): kernel has non-zero weights, prev_resp has zero weights.
+        """
+        lp = 0
+        for k in range(self.K):
+            mean_kernel, mean_prev_resp = self.prior_means[k]
+            sigma_kernel, sigma_prev_resp = self.prior_sigmas[k]
+
+            # Handle kernel weights (first 7 dimensions)
+            for c in range(self.C - 1):
+                kernel_weights = self.Wk[k][c, :7]  # First 7 are kernel (pitch diff)
+                lp += stats.multivariate_normal_logpdf(
+                    kernel_weights.flatten(),
+                    mus=np.repeat(mean_kernel, kernel_weights.size),
+                    Sigmas=(sigma_kernel ** 2) * np.eye(kernel_weights.size)
+                )
+
+            # Handle previous response weights (remaining dimensions)
+            for c in range(self.C - 1):
+                prev_resp_weights = self.Wk[k][c, 7:]  # After 7th is previous response
+                lp += stats.multivariate_normal_logpdf(
+                    prev_resp_weights.flatten(),
+                    mus=np.repeat(mean_prev_resp, prev_resp_weights.size),
+                    Sigmas=(sigma_prev_resp ** 2) * np.eye(prev_resp_weights.size)
+                )
+
+        return lp
+
+    # Calculate time dependent logits - output is matrix of size TxKxC
+    # Input is size TxM
+    def calculate_logits(self, input):
+        """
+        Return array of size TxKxC containing log(pr(yt=C|zt=k))
+        :param input: input array of covariates of size TxM
+        :return: array of size TxKxC containing log(pr(yt=c|zt=k, ut)) for all c in {1, ..., C} and k in {1, ..., K}
+        """
+        # Transpose array dimensions, so that array is now of shape ((C-1)xKx(M+1))
+        Wk_tranpose = np.transpose(self.Wk, (1, 0, 2))
+        # Stack column of zeros to transform array from size ((C-1)xKx(M+1)) to ((C)xKx(M+1)) and then transform shape back to (KxCx(M+1))
+        Wk = np.transpose(np.vstack([Wk_tranpose, np.zeros((1, Wk_tranpose.shape[1], Wk_tranpose.shape[2]))]),
+                          (1, 0, 2))
+        # Input effect; transpose so that output has dims TxKxC
+        time_dependent_logits = np.transpose(np.dot(Wk, input.T), (2, 0, 1)) #Note: this has an unexpected effect when both input (and thus Wk) are empty arrays and returns an array of zeros
+        time_dependent_logits = time_dependent_logits - logsumexp(time_dependent_logits, axis=2, keepdims=True)
+        return time_dependent_logits
+
+    def log_likelihoods(self, data, input, mask, tag):
+        time_dependent_logits = self.calculate_logits(input)
+        assert self.D == 1, "InputDrivenObservations written for D = 1!"
+        mask = np.ones_like(data, dtype=bool) if mask is None else mask
+        return stats.categorical_logpdf(data[:, None, :], time_dependent_logits[:, :, None, :], mask=mask[:, None, :])
+
+    def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
+        assert self.D == 1, "InputDrivenObservations written for D = 1!"
+        if input.ndim == 1 and input.shape == (self.M,): # if input is vector of size self.M (one time point), expand dims to be (1, M)
+            input = np.expand_dims(input, axis=0)
+        time_dependent_logits = self.calculate_logits(input)  # size TxKxC
+        ps = np.exp(time_dependent_logits)
+        T = time_dependent_logits.shape[0]
+        if T == 1:
+            sample = np.array([npr.choice(self.C, p=ps[t, z]) for t in range(T)])
+        elif T > 1:
+            sample = np.array([npr.choice(self.C, p=ps[t, z[t]]) for t in range(T)])
+        return sample
+
+    def m_step(self, expectations, datas, inputs, masks, tags, optimizer = "bfgs", **kwargs):
+        """
+        Override the M-step to enforce constraints:
+        - State 1 (perseverating): Force zero weight on kernel (pitch_diff).
+        - State 2 (engaged): Force zero weight on previous response.
+        """
+        T = sum([data.shape[0] for data in datas]) #total number of datapoints
+
+        def _multisoftplus(X):
+            '''
+            computes f(X) = log(1+sum(exp(X), axis =1)) and its first derivative
+            :param X: array of size Tx(C-1)
+            :return f(X) of size T and df of size (Tx(C-1))
+            '''
+            X_augmented = np.append(X, np.zeros((X.shape[0], 1)), 1) # append a column of zeros to X for rowmax calculation
+            rowmax = np.max(X_augmented, axis = 1, keepdims=1) #get max along column for log-sum-exp trick, rowmax is size T
+            # compute f:
+            f = np.log(np.exp(-rowmax[:,0]) + np.sum(np.exp(X - rowmax), axis = 1)) + rowmax[:,0]
+            # compute df
+            df = np.exp(X - rowmax)/np.expand_dims((np.exp(-rowmax[:,0]) + np.sum(np.exp(X - rowmax), axis = 1)), axis = 1)
+            return f, df
+
+        def _objective(params, k, c):
+            W = np.reshape(params, (1, self.M))  # We optimize for one class at a time
+            obj = 0
+            for data, input, mask, tag, (expected_states, _, _) in zip(datas, inputs, masks, tags, expectations):
+                xproj = input @ W.T  # Projection of input onto weight matrix
+                f, _ = _multisoftplus(xproj)
+                data_one_hot = one_hot(data[:, 0], self.C)
+                obj += (-np.sum(data_one_hot[:, c:c+1] * xproj, axis=1) + f) @ expected_states[:, k]
+
+            # Add prior contributions
+            mean_kernel, mean_prev_resp = self.prior_means[k]
+            sigma_kernel, sigma_prev_resp = self.prior_sigmas[k]
+
+            # Kernel weights (first 7 dimensions)
+            kernel_weights = W[:, :7]
+            obj += 1 / (2 * sigma_kernel ** 2) * np.sum((kernel_weights - mean_kernel) ** 2)
+
+            # Previous response weights (after 7th dimension)
+            prev_resp_weights = W[:, 7:]
+            obj += 1 / (2 * sigma_prev_resp ** 2) * np.sum((prev_resp_weights - mean_prev_resp) ** 2)
+
+            return obj / T
+
+        def _gradient(params, k, c):
+            W = np.reshape(params, (1, self.M))
+            grad = np.zeros((1, self.M))
+            for data, input, mask, tag, (expected_states, _, _) in zip(datas, inputs, masks, tags, expectations):
+                xproj = input @ W.T
+                _, df = _multisoftplus(xproj)
+                data_one_hot = one_hot(data[:, 0], self.C)
+                grad += (df - data_one_hot[:, c:c+1]).T @ (expected_states[:, [k]] * input)
+
+            # Add prior contributions to gradient
+            mean_kernel, mean_prev_resp = self.prior_means[k]
+            sigma_kernel, sigma_prev_resp = self.prior_sigmas[k]
+
+            # Kernel weights
+            kernel_weights = W[:, :7]
+            grad[:, :7] += (kernel_weights - mean_kernel) / sigma_kernel ** 2
+
+            # Previous response weights
+            prev_resp_weights = W[:, 7:]
+            grad[:, 7:] += (prev_resp_weights - mean_prev_resp) / sigma_prev_resp ** 2
+
+            return grad.flatten() / T
+
+        def _hess(params, k):
+            '''
+            Explicit calculation of hessian of _objective w.r.t weight matrix for state k, W_{k}
+            :param params: vector of size (C-1)xM
+            :param k: state whose parameters we are currently optimizing
+            :return hessian of objective with respect to parameters; matrix of size ((C-1)xM) x ((C-1)xM)
+            '''
+            W = np.reshape(params, (self.C - 1, self.M))
+            hess = np.zeros(((self.C - 1)*self.M, (self.C - 1)*self.M))
+            for data, input, mask, tag, (expected_states, _, _) \
+                    in zip(datas, inputs, masks, tags, expectations):
+                xproj = input @ W.T  # projection of input onto weight matrix for particular state
+                _, df = _multisoftplus(xproj)
+                # center blocks:
+                dftensor = np.expand_dims(df, axis = 2) # dims are now (T,  (C-1), 1)
+                Xdf = np.expand_dims(input, axis = 1) * dftensor # multiply every input covariate term with every class derivative term for a given time step; dims are now (T, (C-1), M)
+                # reshape Xdf to (T, (C-1)*M)
+                Xdf = np.reshape(Xdf, (Xdf.shape[0], -1))
+                # weight Xdf by posterior state probabilities
+                pXdf = expected_states[:, [k]]*Xdf # output is size (T, (C-1)*M)
+                # outer product with input vector, size (M, (C-1)*M)
+                XXdf = input.T @ pXdf
+                # center blocks of hessian:
+                temp_hess = np.zeros(((self.C - 1) * self.M, (self.C - 1) * self.M))
+                for c in range(1, self.C):
+                    inds = range((c - 1)*self.M,c*self.M)
+                    temp_hess[np.ix_(inds, inds)] = XXdf[:, inds]
+                # off diagonal entries:
+                hess += temp_hess - Xdf.T@pXdf
+            # add contribution of prior to hessian
+            if self.prior_sigma != 0:
+                hess += (1 / (self.prior_sigma) ** 2)
+            return hess/T
+        
+        def _apply_constraints(W, k):
+            """
+            Enforce constraints:
+            - State 1 (k=0): Set kernel weights (first 7 dims) to 0.
+            - State 2 (k=1): Set previous response weights (after 7th dim) to 0.
+            """
+            if k == 0:  # Perseverating state
+                W[:, :7] = 0  # Zero kernel weights
+            elif k == 1:  # Engaged state
+                W[:, 7:] = 0  # Zero previous response weights
+            return W
+        
+        from scipy.optimize import minimize
+        # Optimize weights for each state and class separately
+        for k in range(self.K):
+            for c in range(self.C - 1):  # For each class
+                def _objective_kc(params):
+                    return _objective(params, k, c)
+
+                def _gradient_kc(params):
+                    return _gradient(params, k, c)
+
+                params = self.Wk[k][c].flatten()  # Flatten params for class c
+                sol = minimize(_objective_kc, params, jac=_gradient_kc, method=optimizer)
+                W_opt = np.reshape(sol.x, (1, self.M))
+
+                # Apply constraints based on state
+                self.Wk[k][c] = _apply_constraints(W_opt, k)
+
+    def smooth(self, expectations, data, input, tag):
+        """
+        Compute the mean observation under the posterior distribution
+        of latent discrete states.
+        """
+        raise NotImplementedError
 
 class _AutoRegressiveObservationsBase(Observations):
     """

@@ -89,6 +89,7 @@ class HMM(object):
             bernoulli=obs.BernoulliObservations,
             categorical=obs.CategoricalObservations,
             input_driven_obs=obs.InputDrivenObservations,
+            ind_input_driven_obs=obs.IndepInputDrivenObservations, 
             poisson=obs.PoissonObservations,
             vonmises=obs.VonMisesObservations,
             ar=obs.AutoRegressiveObservations,
