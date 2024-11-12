@@ -209,6 +209,43 @@ class StickyTransitions(StationaryTransitions):
         # Return (T-1, D, D) array of blocks for the diagonal of the Hessian
         T, D = data.shape
         return np.zeros((T-1, D, D))
+    
+class StickyTransitionsWithTwoAlpha(StationaryTransitions):
+    """
+    Upweight the self-transition prior with two alpha values.
+    pi_k ~ Dir(alpha1 + kappa * e_k for state k=1 and alpha2 for state k=2)
+    """
+    def __init__(self, K, D, M=0, alpha1=1, alpha2=1, kappa=100):
+        # Pass only K, D, and M to the parent class constructor
+        super(StickyTransitionsWithTwoAlpha, self).__init__(K, D, M)
+        self.alpha1 = alpha1
+        self.alpha2 = alpha2
+        self.kappa = kappa
+
+    def log_prior(self):
+        K = self.K
+        log_P = self.log_Ps - logsumexp(self.log_Ps, axis=1, keepdims=True)
+        lp = 0
+        for k in range(K):
+            if k == 0:  # Use alpha1 for the first state
+                alpha = self.alpha1 * np.ones(K) + self.kappa * (np.arange(K) == k)
+            else:  # Use alpha2 for the other states
+                alpha = self.alpha2 * np.ones(K)
+            lp += np.dot((alpha - 1), log_P[k])
+        return lp
+
+    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
+        expected_joints = sum([np.sum(Ezzp1, axis=0) for _, Ezzp1, _ in expectations]) + 1e-16
+        expected_joints += self.kappa * np.eye(self.K) + (self.alpha1 - 1) * np.ones((self.K, self.K))
+        P = (expected_joints / expected_joints.sum(axis=1, keepdims=True)) + 1e-16
+        assert np.all(P >= 0), "Transition matrix entries must be non-negative! Check alpha >= 1"
+        self.log_Ps = np.log(P)
+
+    def neg_hessian_expected_log_trans_prob(self, data, input, mask, tag, expected_joints):
+        T, D = data.shape
+        return np.zeros((T-1, D, D))
+
+
 
 class InputDrivenTransitions(StickyTransitions):
     """

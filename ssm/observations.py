@@ -3,6 +3,9 @@ import warnings
 
 import autograd.numpy as np
 import autograd.numpy.random as npr
+from autograd import hessian
+from numpy.linalg import inv
+
 
 from autograd.scipy.special import gammaln, digamma, logsumexp
 from autograd.scipy.special import logsumexp
@@ -829,7 +832,7 @@ class IndepInputDrivenObservations(Observations):
         @param prior_means: List of tuples for (mean_kernel, mean_prev_resp) for each state
         @param prior_sigmas: List of tuples for (sigma_kernel, sigma_prev_resp) for each state
         """
-        super(IndepInputDrivenObservations, self).__init__(K, D, M, C)
+        super(IndepInputDrivenObservations, self).__init__(K, D, M)
         self.C = C
         self.M = M
         self.D = D

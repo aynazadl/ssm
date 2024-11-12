@@ -53,6 +53,7 @@ class HMM(object):
             stationary=trans.StationaryTransitions,
             constrained=trans.ConstrainedStationaryTransitions,
             sticky=trans.StickyTransitions,
+            sticky2=trans.StickyTransitionsWithTwoAlpha, 
             inputdriven=trans.InputDrivenTransitions,
             recurrent=trans.RecurrentTransitions,
             recurrent_only=trans.RecurrentOnlyTransitions,

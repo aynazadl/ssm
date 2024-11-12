@@ -5,7 +5,7 @@
 
 import numpy as np
 cimport numpy as np
-
+np.import_array()
 from cython.parallel import prange
 
 # Cython functions for computing sufficient statistics
